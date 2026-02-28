@@ -1,0 +1,106 @@
+__id__ = "troll_sender"
+__name__ = "Troll Sender"
+__description__ = "По команде '.troll [ТЕКСТ]' отправляет каждое слово из текста как отдельное сообщение"
+__author__ = "@Xarvyn & @exteraPl"
+__version__ = "1.0"
+__icon__ = "Input_Key_by_EmojiRu_Bot/1"
+__min_version__ = "11.12.0"
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import run_on_queue, PLUGINS_QUEUE, send_text, get_last_fragment
+from ui.settings import Header, Input
+from ui.bulletin import BulletinHelper
+from typing import Any, List
+from time import sleep
+import re
+class TrollPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+    def on_plugin_unload(self):
+        return None
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Troll Sender Settings"),
+            Input(
+                key="troll_interval_ms",
+                text="Interval between messages (ms)",
+                default="500",
+                subtext="Delay in milliseconds between sending each word",
+                icon="msg_timer",
+                on_change=self._on_interval_change
+            )
+        ]
+    def _on_interval_change(self, new_value: str):
+        try:
+            v = int(new_value)
+            if v < 0:
+                raise ValueError()
+            self.set_setting("troll_interval_ms", str(v))
+        except Exception:
+            fragment = get_last_fragment()
+            try:
+                BulletinHelper.show_error("Invalid interval value. Use an integer >= 0.", fragment)
+            except Exception:
+                try:
+                    BulletinHelper.show_error("Invalid interval value. Use an integer >= 0.")
+                except Exception:
+                    pass
+    def _show_bulletin(self, text: str):
+        fragment = get_last_fragment()
+        try:
+            BulletinHelper.show_error(text, fragment)
+        except Exception:
+            try:
+                BulletinHelper.show_error(text)
+            except Exception:
+                pass
+    def _clean_word(self, word: str) -> str:
+        cleaned = re.sub(r'[^\w\s]', '', word, flags=re.UNICODE)
+        return cleaned.strip()
+    def _send_sequence(self, peer_id: Any, words: List[str], interval_ms: int):
+        try:
+            for w in words:
+                cleaned = self._clean_word(w)
+                if not cleaned:
+                    continue
+                try:
+                    send_text(peer_id, cleaned)
+                except Exception:
+                    pass
+                if interval_ms > 0:
+                    sleep(interval_ms / 1000.0)
+        except Exception:
+            pass
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not hasattr(params, "message") or not isinstance(params.message, str):
+            return HookResult()
+        msg = params.message.strip()
+        if not msg.startswith(".troll"):
+            return HookResult()
+        remainder = msg[len(".troll"):].strip()
+        if not remainder:
+            self._show_bulletin("Usage: .troll [text]")
+            return HookResult(strategy=HookStrategy.CANCEL)
+        try:
+            interval_raw = self.get_setting("troll_interval_ms", "500")
+            try:
+                interval_ms = int(interval_raw)
+                if interval_ms < 0:
+                    raise ValueError()
+            except Exception:
+                self._show_bulletin("Invalid interval setting. Please set a non-negative integer (ms).")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = [w for w in remainder.split() if w]
+            cleaned_words = [self._clean_word(w) for w in words]
+            cleaned_words = [w for w in cleaned_words if w]
+            if not cleaned_words:
+                self._show_bulletin("No words found to send after removing punctuation.")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            peer_id = getattr(params, "peer", None)
+            if peer_id is None:
+                self._show_bulletin("Could not determine chat peer to send messages.")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            run_on_queue(lambda: self._send_sequence(peer_id, cleaned_words, interval_ms), PLUGINS_QUEUE)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            self._show_bulletin(f"Unexpected error: {str(e)}")
+            return HookResult(strategy=HookStrategy.CANCEL)
