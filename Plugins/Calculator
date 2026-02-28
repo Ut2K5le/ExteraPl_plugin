@@ -1,0 +1,138 @@
+__id__ = "calc"
+__name__ = "Calculator"
+__description__ = "Калькулятор в ExteraGram"
+__author__ = "@Xarvyn & @exteraPl"
+__version__ = "1.0"
+__icon__ = "Input_Key_by_EmojiRu_Bot/0"
+__min_version__ = "11.12.0"
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment
+from typing import Any
+import ast
+import operator as _op
+_OPERATORS = {
+    ast.Add: _op.add,
+    ast.Sub: _op.sub,
+    ast.Mult: _op.mul,
+    ast.Div: _op.truediv,
+    ast.Mod: _op.mod,
+    ast.Pow: _op.pow,
+    ast.FloorDiv: _op.floordiv
+}
+def _eval_node(node):
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body)
+    if isinstance(node, ast.BinOp):
+        op_type = type(node.op)
+        if op_type not in _OPERATORS:
+            raise ValueError("unsupported operator")
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        return _OPERATORS[op_type](left, right)
+    if isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.UAdd):
+            return +_eval_node(node.operand)
+        if isinstance(node.op, ast.USub):
+            return -_eval_node(node.operand)
+        raise ValueError("unsupported unary operator")
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node.value, str):
+            raise ValueError("string_literal_detected")
+        raise ValueError("unsupported constant")
+    if isinstance(node, ast.Num):
+        return node.n
+    raise ValueError("unsupported expression")
+def safe_eval(expr: str):
+    parsed = ast.parse(expr, mode="eval")
+    return _eval_node(parsed)
+class CalcPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+    def on_plugin_unload(self):
+        return None
+    def _show_bulletin(self, text: str):
+        fragment = get_last_fragment()
+        try:
+            BulletinHelper.show_error(text, fragment)
+        except Exception:
+            try:
+                BulletinHelper.show_error(text, None)
+            except Exception:
+                pass
+    def _show_info_dialog(self, title: str, text: str):
+        fragment = get_last_fragment()
+        if not fragment:
+            self._show_bulletin(text)
+            return
+        try:
+            activity = fragment.getParentActivity()
+            if not activity:
+                self._show_bulletin(text)
+                return
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(title)
+            builder.set_message(text)
+            def _ok(bld, which):
+                try:
+                    bld.dismiss()
+                except Exception:
+                    pass
+            builder.set_positive_button("OK", _ok)
+            try:
+                builder.show()
+            except Exception:
+                try:
+                    bld = builder.create()
+                    bld.show()
+                except Exception:
+                    self._show_bulletin(text)
+        except Exception:
+            self._show_bulletin(text)
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not hasattr(params, 'message') or not isinstance(params.message, str):
+            return HookResult()
+        msg = params.message.strip()
+        if not msg.startswith(".calc"):
+            return HookResult()
+        try:
+            remainder = msg[len(".calc"):].strip()
+            if not remainder:
+                self._show_bulletin("Usage: .calc [-p|-help] expression")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            if remainder.startswith("-help"):
+                info_text = f"Версия: {__version__}\nАтрибуты:\n  1. -p - показывает пример перед показом (\".calc -p 5+90\" > \"5+90=95\")\n  2. -help - показывает информацию\n\nСоздатели: @Xarvyn & @exteraPl"
+                self._show_info_dialog("Информация", info_text)
+                return HookResult(strategy=HookStrategy.CANCEL)
+            flag = None
+            if remainder.startswith("-p"):
+                flag = "-p"
+                expr = remainder[len("-p"):].strip()
+            else:
+                expr = remainder
+            expr_clean = "".join(expr.split())
+            if not expr_clean:
+                self._show_bulletin("Usage: .calc [-p|-help] expression")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            try:
+                result = safe_eval(expr_clean)
+            except ValueError as ve:
+                if "string_literal" in str(ve):
+                    self._show_bulletin("Strings are not allowed in expression")
+                    return HookResult(strategy=HookStrategy.CANCEL)
+                self._show_bulletin(f"Error: {str(ve)}")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            except SyntaxError:
+                self._show_bulletin("Invalid expression syntax")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            if flag == "-p":
+                params.message = f"{expr_clean}={result}"
+            else:
+                params.message = str(result)
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+        except Exception as e:
+            self._show_bulletin(f"Unexpected error: {str(e)}")
+            return HookResult(strategy=HookStrategy.CANCEL)
