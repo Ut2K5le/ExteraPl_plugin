@@ -1,0 +1,231 @@
+__id__ = "onlineplugin"
+__name__ = "Forever Status "
+__author__ = "@lishonov & @mopsikplugin"
+__version__ = "1.0.0"
+__description__ = """Вечный онлайн"""
+
+__icon__ = "dlya_plaginov_by_TgEmodziBot/12"
+__min_version__ = "11.12.0"
+
+import time
+import threading
+from typing import Dict, Any, Optional
+from dataclasses import dataclass, field
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from android_utils import log, run_on_ui_thread
+from client_utils import get_messages_controller, get_last_fragment, run_on_queue
+from ui.settings import Header, Switch, Text, Divider
+from ui.bulletin import BulletinHelper
+
+from org.telegram.tgnet import TLRPC
+from org.telegram.messenger import UserConfig, MessagesController, AndroidUtilities
+from java.util import ArrayList
+from java.lang import Long
+
+@dataclass
+class StatusSettings:
+    enabled: bool = False
+    forever_online: bool = False
+    _is_processing: bool = field(default=False, init=False, repr=False)
+    
+    def get_forced_status(self) -> Optional[str]:
+        if not self.enabled:
+            return None
+        if self.forever_online:
+            return "online"
+        return None
+
+class StatusManager:
+    def __init__(self, plugin_instance: BasePlugin):
+        self.plugin = plugin_instance
+        self.settings = StatusSettings()
+        self.is_active = False
+        self.hook_refs = []
+        self._status_lock = threading.Lock()
+        self._app_state = "active"
+        self.UPDATE_INTERVAL = 30000
+        
+        self.HOOK_STATUS_UPDATE = "TL_account_updateStatus"
+    
+    def log(self, message: str):
+        log(f"[ForeverStatus] {message}")
+    
+    def load_settings(self):
+        try:
+            with self._status_lock:
+                self.settings.enabled = self.plugin.get_setting("enabled", False)
+                self.settings.forever_online = self.plugin.get_setting("forever_online", False)
+        except Exception as e:
+            self.log(f"Load settings error: {e}")
+    
+    def save_settings(self):
+        try:
+            with self._status_lock:
+                self.plugin.set_setting("enabled", self.settings.enabled)
+                self.plugin.set_setting("forever_online", self.settings.forever_online)
+        except Exception as e:
+            self.log(f"Save settings error: {e}")
+    
+    def setup_hooks(self):
+        try:
+            self.hook_refs.append(self.plugin.add_hook(self.HOOK_STATUS_UPDATE))
+            return True
+        except Exception as e:
+            self.log(f"Hook setup error: {e}")
+            return False
+    
+    def remove_hooks(self):
+        for hook_ref in self.hook_refs:
+            try:
+                self.plugin.unhook_method(hook_ref)
+            except:
+                pass
+        self.hook_refs.clear()
+    
+    def apply_forced_status(self):
+        try:
+            with self._status_lock:
+                if not self.settings.enabled:
+                    return False
+                
+                messages_controller = get_messages_controller()
+                user_id = UserConfig.getInstance(0).getClientUserId()
+                
+                status = TLRPC.TL_userStatusOnline()
+                status.expires = int((time.time() + 300) * 1000)
+                
+                user = messages_controller.getUser(user_id)
+                if user:
+                    user.status = status
+                    messages_controller.putUser(user, True)
+                    return True
+                        
+        except Exception as e:
+            self.log(f"Apply status error: {e}")
+        return False
+    
+    def handle_status_update(self, request: Any) -> Optional[HookResult]:
+        try:
+            with self._status_lock:
+                if not self.settings.enabled:
+                    return None
+                
+                forced_status = self.settings.get_forced_status()
+                
+                if forced_status == "online":
+                    if hasattr(request, 'status'):
+                        new_status = TLRPC.TL_userStatusOnline()
+                        new_status.expires = int((time.time() + 300) * 1000)
+                        request.status = new_status
+                        return HookResult(strategy=HookStrategy.MODIFY, request=request)
+                
+                return None
+                
+        except Exception as e:
+            self.log(f"Status update error: {e}")
+            return None
+    
+    def update_app_state(self, state: str):
+        with self._status_lock:
+            if self._app_state != state:
+                self._app_state = state
+                if state == "active" and self.settings.forever_online:
+                    run_on_queue(lambda: self.apply_forced_status())
+    
+    def start_periodic_updates(self):
+        def update_task():
+            while self.is_active and self.settings.enabled and self.settings.forever_online:
+                try:
+                    if self._app_state == "active":
+                        self.apply_forced_status()
+                    time.sleep(self.UPDATE_INTERVAL / 1000)
+                except Exception as e:
+                    time.sleep(5)
+        
+        if self.settings.forever_online:
+            thread = threading.Thread(target=update_task, daemon=True)
+            thread.start()
+    
+    def cleanup(self):
+        self.is_active = False
+        self.remove_hooks()
+
+class ForeverStatusPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.settings_manager = StatusManager(self)
+    
+    def create_settings(self):
+        return [
+            Header(text="Управление статусом"),
+            Text(text="Настройки вечного онлайн статуса", icon="msg_info_solar"),
+            Divider(),
+            Switch(key="enabled", text="Включить работу плагина", default=False, icon="msg_online", on_change=self._on_enabled_changed),
+            Switch(key="forever_online", text="Включить вечный онлайн", default=False, icon="msg_online", on_change=self._on_online_changed),
+        ]
+    
+    def _on_enabled_changed(self, enabled: bool):
+        self.settings_manager.settings.enabled = enabled
+        self.settings_manager.save_settings()
+        
+        if enabled:
+            self.settings_manager.is_active = True
+            self.settings_manager.setup_hooks()
+            self.settings_manager.start_periodic_updates()
+            
+            forced_status = self.settings_manager.settings.get_forced_status()
+            if forced_status == "online":
+                self.settings_manager.apply_forced_status()
+        else:
+            self.settings_manager.cleanup()
+    
+    def _on_online_changed(self, enabled: bool):
+        self.settings_manager.settings.forever_online = enabled
+        self.settings_manager.save_settings()
+        
+        if enabled:
+            self.settings_manager.apply_forced_status()
+            self.settings_manager.start_periodic_updates()
+    
+    def log(self, message: str):
+        log(f"[ForeverStatus] {message}")
+    
+    def on_plugin_load(self):
+        self.settings_manager.load_settings()
+        
+        if self.settings_manager.settings.enabled:
+            self.settings_manager.is_active = True
+            self.settings_manager.setup_hooks()
+            self.settings_manager.start_periodic_updates()
+            
+            forced_status = self.settings_manager.settings.get_forced_status()
+            if forced_status == "online":
+                run_on_queue(lambda: self.settings_manager.apply_forced_status())
+    
+    def on_plugin_unload(self):
+        self.settings_manager.cleanup()
+    
+    def on_application_event(self, event: str):
+        if event == "START":
+            self.settings_manager.update_app_state("active")
+        elif event == "PAUSE":
+            self.settings_manager.update_app_state("background")
+        elif event == "RESUME":
+            self.settings_manager.update_app_state("active")
+        elif event == "STOP":
+            self.settings_manager.update_app_state("destroyed")
+    
+    def post_request_hook(self, account: int, request: Any, response: Any) -> HookResult:
+        try:
+            request_name = request.__class__.__name__
+            
+            if request_name == "TL_account_updateStatus":
+                return self.settings_manager.handle_status_update(request) or HookResult()
+            
+        except Exception as e:
+            self.log(f"Hook error: {e}")
+        
+        return HookResult()
+
+plugin_instance = ForeverStatusPlugin()
