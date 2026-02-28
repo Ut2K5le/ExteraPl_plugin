@@ -1,0 +1,99 @@
+__id__ = "ip"
+__name__ = "get_ip"
+__description__ = "Показывает IP по кнопке"
+__author__ = "@Xarvyn & @ExteraPl"
+__version__ = "1.0"
+__icon__ = "Input_Key_by_EmojiRu_Bot/8"
+__min_version__ = "11.12.0"
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import run_on_queue, get_last_fragment
+from android_utils import run_on_ui_thread, log
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from android.content import Context, ClipData
+import requests
+
+class ChatIPPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="IP",
+                on_click=self.handle_chat_ip_click,
+                item_id="chat_ip_menu_item",
+                icon="msg_photo_flip"
+            )
+        )
+
+    def on_plugin_unload(self):
+        self.log("ChatIPPlugin unloaded.")
+
+    def handle_chat_ip_click(self, context):
+        fragment = context.get("fragment") or get_last_fragment()
+        activity = None
+        if fragment:
+            try:
+                activity = fragment.getParentActivity()
+            except Exception:
+                activity = None
+        if not activity:
+            activity = context.get("context")
+        if not activity:
+            self.log("Cannot obtain activity to show IP dialog.")
+            return
+
+        spinner = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+        spinner.set_title("IP")
+        spinner.set_message("Загрузка...")
+        spinner.set_cancelable(False)
+        spinner.show()
+
+        def fetch_ip():
+            ip_text = "Unknown"
+            try:
+                resp = requests.get("https://api.ipify.org?format=text", timeout=6)
+                if resp.status_code == 200:
+                    ip_text = resp.text.strip()
+                else:
+                    ip_text = f"Ошибка: HTTP {resp.status_code}"
+            except Exception as e:
+                ip_text = f"Ошибка: {str(e)}"
+                log(f"ChatIPPlugin: failed to fetch IP: {e}")
+
+            def show_result():
+                try:
+                    try:
+                        spinner.dismiss()
+                    except Exception:
+                        pass
+                    builder = AlertDialogBuilder(activity)
+                    builder.set_title("IP")
+                    builder.set_message(f"IP: {ip_text}")
+                    def on_copy(b, w):
+                        try:
+                            clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE)
+                            clip = ClipData.newPlainText("IP", ip_text)
+                            clipboard.setPrimaryClip(clip)
+                            try:
+                                if fragment:
+                                    BulletinHelper.show_copied_to_clipboard("Скопировано в буфер обмена", fragment)
+                                else:
+                                    BulletinHelper.show_copied_to_clipboard("Скопировано в буфер обмена", activity)
+                            except Exception:
+                                try:
+                                    BulletinHelper.show_copied_to_clipboard(None, fragment or activity)
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            log(f"ChatIPPlugin: failed to copy to clipboard: {e}")
+                    builder.set_neutral_button("Копировать", on_copy)
+                    builder.set_positive_button("Ок", lambda b, w: b.dismiss())
+                    builder.set_cancelable(True)
+                    builder.show()
+                except Exception as e:
+                    log(f"ChatIPPlugin: failed to show result dialog: {e}")
+
+            run_on_ui_thread(show_result)
+
+        run_on_queue(fetch_ip)
