@@ -1,0 +1,310 @@
+import requests
+from android_utils import log, run_on_ui_thread
+from client_utils import run_on_queue, send_text, PLUGINS_QUEUE, get_last_fragment
+from ui.settings import Header, Input, Divider, Selector, Switch
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from typing import Any
+
+__id__ = "llm_assistant"
+__name__ = "LLM Assistant"
+__description__ = "ИИ инструмент прямо в чате, по команде '.llm [ЗАПРОС' отправляет в чат ответ от ИИ, обязательно укажите API в настройках"
+__author__ = "@Xarvyn & @ExteraPl"
+__version__ = "1.0"
+__icon__ = "DMJDuckX2/5"
+__min_version__ = "11.12.0"
+
+GEMINI_ENDPOINT_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+OPENAI_CHAT_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+OPENAI_DEFAULT_MODEL = "gpt-3.5-turbo"
+
+def _extract_gemini_text(resp_json):
+    try:
+        candidates = resp_json.get("candidates") or resp_json.get("responses") or []
+        if isinstance(candidates, list) and candidates:
+            cand = candidates[0]
+            content = cand.get("content") or {}
+            if isinstance(content, dict):
+                parts = content.get("parts") or []
+                if isinstance(parts, list) and parts:
+                    texts = []
+                    for p in parts:
+                        if isinstance(p, dict):
+                            t = p.get("text") or p.get("content")
+                            if t:
+                                texts.append(t)
+                        elif isinstance(p, str):
+                            texts.append(p)
+                    if texts:
+                        return "\n".join(texts)
+            if "text" in cand:
+                return cand.get("text")
+            if "output" in cand:
+                if isinstance(cand["output"], str):
+                    return cand["output"]
+        if "response" in resp_json and isinstance(resp_json["response"], str):
+            return resp_json["response"]
+    except Exception as e:
+        log(f"_extract_gemini_text error: {e}")
+    return None
+
+def _extract_openai_text(resp_json):
+    try:
+        choices = resp_json.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if "message" in first and isinstance(first["message"], dict):
+                content = first["message"].get("content")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, dict):
+                    text = content.get("text")
+                    if text:
+                        return text
+            if "text" in first and isinstance(first["text"], str):
+                return first["text"]
+            if "delta" in first:
+                d = first.get("delta")
+                if isinstance(d, dict):
+                    t = d.get("content") or d.get("text")
+                    if t:
+                        return t
+        if "output" in resp_json and isinstance(resp_json["output"], str):
+            return resp_json["output"]
+        if "message" in resp_json and isinstance(resp_json["message"], str):
+            return resp_json["message"]
+    except Exception as e:
+        log(f"_extract_openai_text error: {e}")
+    return None
+
+def _call_gemini(api_key: str, prompt: str, model: str = GEMINI_DEFAULT_MODEL, timeout: int = 30):
+    try:
+        url = GEMINI_ENDPOINT_TEMPLATE.format(model=model)
+        headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        r = requests.post(url, headers=headers, json=body, timeout=timeout)
+        if r.status_code != 200:
+            log(f"Gemini API error status {r.status_code}: {r.text}")
+            return None
+        data = r.json()
+        text = _extract_gemini_text(data)
+        return text or ""
+    except Exception as e:
+        log(f"Gemini request failed: {e}")
+        return None
+
+def _call_openai(api_key: str, prompt: str, model: str = OPENAI_DEFAULT_MODEL, timeout: int = 30):
+    try:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 800}
+        r = requests.post(OPENAI_CHAT_ENDPOINT, headers=headers, json=body, timeout=timeout)
+        if r.status_code != 200:
+            log(f"OpenAI API error status {r.status_code}: {r.text}")
+            return None
+        data = r.json()
+        text = _extract_openai_text(data)
+        return text or ""
+    except Exception as e:
+        log(f"OpenAI request failed: {e}")
+        return None
+
+def _get_peer_id_from_params(params):
+    try:
+        for attr in ("dialog_id", "dialogId", "peer_id", "peerId", "chat_id", "chatId"):
+            if hasattr(params, attr):
+                val = getattr(params, attr)
+                try:
+                    return int(val)
+                except Exception:
+                    try:
+                        if hasattr(val, "getId"):
+                            return int(val.getId())
+                    except Exception:
+                        continue
+        if hasattr(params, "getDialogId"):
+            try:
+                return int(params.getDialogId())
+            except Exception:
+                pass
+        if hasattr(params, "peer"):
+            peer = getattr(params, "peer")
+            try:
+                return int(peer)
+            except Exception:
+                try:
+                    if hasattr(peer, "getId"):
+                        return int(peer.getId())
+                except Exception:
+                    pass
+    except Exception as e:
+        log(f"_get_peer_id_from_params error: {e}")
+    return None
+
+class LLMPlugin(BasePlugin):
+    def create_settings(self) -> list:
+        return [
+            Header(text="LLM Settings"),
+            Selector(
+                key="llm_model_key",
+                text="Model",
+                default=0,
+                items=["Gemini", "ChatGPT"],
+                icon="msg_settings"
+            ),
+            Input(
+                key="llm_api_key",
+                text="API Key",
+                default="",
+                subtext="Введите API-ключ для выбранной модели",
+                icon="input_bot1"
+            ),
+            Divider(),
+            Header(text="General Settings"),
+            Input(
+                key="llm_system_prompt",
+                text="Промпт для ИИ",
+                default="",
+                subtext="Системный промпт/роль для модели (опционально)",
+                icon="input_bot1"
+            ),
+            Switch(
+                key="llm_prefix_enabled",
+                text="Подписывать можешь",
+                default=False,
+                subtext="Если включено, перед ответом ИИ будет префикс с названием модели",
+                icon="msg_settings"
+            ),
+            Divider()
+        ]
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self._active_dialog = None
+
+    def on_plugin_unload(self):
+        try:
+            if getattr(self, "_active_dialog", None):
+                def _dismiss():
+                    try:
+                        dlg = self._active_dialog
+                        if dlg:
+                            dlg.dismiss()
+                    except Exception:
+                        pass
+                run_on_ui_thread(_dismiss)
+                self._active_dialog = None
+        except Exception as e:
+            log(f"on_plugin_unload error: {e}")
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            if not hasattr(params, "message"):
+                return HookResult()
+            message = params.message
+            if not isinstance(message, str):
+                return HookResult()
+            if not message.strip().lower().startswith(".llm"):
+                return HookResult()
+            parts = message.strip().split(" ", 1)
+            if len(parts) < 2 or not parts[1].strip():
+                params.message = "Usage: .llm [запрос]"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            prompt = parts[1].strip()
+            model_index = self.get_setting("llm_model_key", 0)
+            api_key = self.get_setting("llm_api_key", "")
+            prefix_enabled = self.get_setting("llm_prefix_enabled", False)
+            system_prompt = self.get_setting("llm_system_prompt", "") or ""
+            if not api_key:
+                params.message = "LLM API key not set. Откройте настройки плагина и укажите ключ."
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            peer_id = _get_peer_id_from_params(params)
+            if peer_id is None:
+                params.message = "Не удалось определить чат для отправки ответа."
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            fragment = get_last_fragment()
+            builder_holder = {"b": None}
+            if fragment:
+                activity = fragment.getParentActivity()
+                if activity:
+                    def _show_loading():
+                        try:
+                            bld = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+                            bld.set_title("Генерация ответа")
+                            bld.set_message("Запрос отправлен, формируется ответ...")
+                            bld.set_cancelable(False)
+                            bld.show()
+                            builder_holder["b"] = bld
+                            self._active_dialog = bld
+                        except Exception as e:
+                            log(f"show_loading error: {e}")
+                    run_on_ui_thread(_show_loading)
+            else:
+                try:
+                    BulletinHelper.show_info("LLM: отправлен запрос, формируется ответ...")
+                except Exception:
+                    pass
+            def task():
+                try:
+                    full_prompt = prompt
+                    if system_prompt and system_prompt.strip():
+                        full_prompt = f"{system_prompt.strip()}\n\n{prompt}"
+                    text = None
+                    if model_index == 0:
+                        text = _call_gemini(api_key, full_prompt)
+                        model_name = "Gemini"
+                    else:
+                        text = _call_openai(api_key, full_prompt)
+                        model_name = "ChatGPT"
+                    try:
+                        def _dismiss_dialog():
+                            try:
+                                dlg = builder_holder.get("b") or getattr(self, "_active_dialog", None)
+                                if dlg:
+                                    dlg.dismiss()
+                            except Exception:
+                                pass
+                            try:
+                                self._active_dialog = None
+                            except Exception:
+                                pass
+                        run_on_ui_thread(_dismiss_dialog)
+                    except Exception:
+                        pass
+                    if text is None:
+                        send_text(peer_id, "Ошибка при обращении к LLM API.")
+                        return
+                    if not text.strip():
+                        send_text(peer_id, "Модель вернула пустой ответ.")
+                        return
+                    if prefix_enabled:
+                        send_text(peer_id, f"🤩{model_name}:\n\n{text}")
+                    else:
+                        send_text(peer_id, text)
+                except Exception as e:
+                    log(f"LLM background task error: {e}")
+                    try:
+                        def _dismiss_on_error():
+                            try:
+                                dlg = builder_holder.get("b") or getattr(self, "_active_dialog", None)
+                                if dlg:
+                                    dlg.dismiss()
+                            except Exception:
+                                pass
+                            try:
+                                self._active_dialog = None
+                            except Exception:
+                                pass
+                        run_on_ui_thread(_dismiss_on_error)
+                    except Exception:
+                        pass
+                    try:
+                        send_text(peer_id, f"LLM error: {e}")
+                    except Exception:
+                        log("Failed to send error message to chat.")
+            run_on_queue(task, PLUGINS_QUEUE)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            log(f"LLMPlugin on_send_message_hook error: {e}")
+            return HookResult()
