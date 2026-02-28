@@ -1,0 +1,194 @@
+from android_utils import log
+from markdown_utils import parse_markdown
+from ui.settings import Header, Selector, Divider, Input
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from typing import Any
+from java import jclass
+
+__id__ = "text_formatter"
+__name__ = "Text Formatter"
+__description__ = "Применяет выбранный фильтр к каждому отправляемому сообщению: Моно / Курсив / Жирный и тд."
+__author__ = "@Xarvyn & @ExteraPl"
+__version__ = "1.0"
+__icon__ = "portals_pepe/3"
+__min_version__ = "11.12.0"
+
+class TextFormatterPlugin(BasePlugin):
+    def create_settings(self) -> list:
+        return [
+            Header(text="Formatting"),
+            Selector(
+                key="format_selector",
+                text="Форматирование",
+                default=0,
+                items=[
+                    "Моно",
+                    "Курсив",
+                    "Жирный",
+                    "Подчеркнутый",
+                    "Зачеркнутый",
+                    "Спойлер",
+                    "Блок кода",
+                    "Ссылка",
+                    "Кастом Эмодзи"
+                ],
+                icon="msg_list"
+            ),
+            Input(
+                key="format_link_url",
+                text="URL для Ссылки",
+                default="",
+                subtext="Если указан — будет использован для формирования [text](url)",
+                icon="msg_text"
+            ),
+            Input(
+                key="format_custom_emoji_id",
+                text="Document ID для Кастом Эмодзи",
+                default="",
+                subtext="ID документа (число) для кастомного эмодзи, используется как [text](document_id)",
+                icon="msg_text"
+            ),
+            Input(
+                key="format_code_language",
+                text="Язык для блока кода (опционально)",
+                default="",
+                subtext="Например: python, java — если пусто, язык не указывается",
+                icon="msg_text"
+            ),
+            Divider()
+        ]
+
+    def on_plugin_load(self):
+        try:
+            self.add_on_send_message_hook()
+            log("TextFormatterPlugin loaded: hook added")
+        except Exception as e:
+            log(f"TextFormatterPlugin on_plugin_load error: {e}")
+
+    def on_plugin_unload(self):
+        try:
+            log("TextFormatterPlugin unloaded")
+        except Exception as e:
+            log(f"TextFormatterPlugin on_plugin_unload error: {e}")
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            if not hasattr(params, "message"):
+                log("on_send_message_hook: params has no 'message' attribute")
+                return HookResult()
+            message = params.message
+            if not isinstance(message, str):
+                log(f"on_send_message_hook: message is not str (type={type(message)})")
+                return HookResult()
+            log(f"on_send_message_hook: original message='{message}'")
+            idx = self.get_setting("format_selector", 0)
+            link_url = self.get_setting("format_link_url", "") or ""
+            custom_emoji_id = self.get_setting("format_custom_emoji_id", "") or ""
+            code_lang = self.get_setting("format_code_language", "") or ""
+            if idx == 0:
+                wrapped = f"`{message}`"
+                log("Selected format: Моно")
+            elif idx == 1:
+                wrapped = f"_{message}_"
+                log("Selected format: Курсив")
+            elif idx == 2:
+                wrapped = f"*{message}*"
+                log("Selected format: Жирный")
+            elif idx == 3:
+                wrapped = f"__{message}__"
+                log("Selected format: Подчеркнутый")
+            elif idx == 4:
+                wrapped = f"~{message}~"
+                log("Selected format: Зачеркнутый")
+            elif idx == 5:
+                wrapped = f"||{message}||"
+                log("Selected format: Спойлер")
+            elif idx == 6:
+                if code_lang.strip():
+                    wrapped = f"```{code_lang.strip()}\n{message}\n```"
+                    log(f"Selected format: Блок кода (language={code_lang.strip()})")
+                else:
+                    wrapped = f"```\n{message}\n```"
+                    log("Selected format: Блок кода (без языка)")
+            elif idx == 7:
+                if link_url.strip():
+                    wrapped = f"[{message}]({link_url.strip()})"
+                    log(f"Selected format: Ссылка -> {link_url.strip()}")
+                else:
+                    log("Selected format: Ссылка но URL не указан — отмена изменения")
+                    return HookResult()
+            elif idx == 8:
+                if custom_emoji_id.strip():
+                    wrapped = f"[{message}]({custom_emoji_id.strip()})"
+                    log(f"Selected format: Кастом Эмодзи -> document_id={custom_emoji_id.strip()}")
+                else:
+                    log("Selected format: Кастом Эмодзи но document_id не указан — отмена изменения")
+                    return HookResult()
+            else:
+                log(f"Selected format index unexpected: {idx}")
+                return HookResult()
+            log(f"Wrapped message for parse: '{wrapped}'")
+            try:
+                parsed = parse_markdown(wrapped)
+                log("parse_markdown: success")
+            except Exception as e:
+                log(f"parse_markdown error: {e}")
+                return HookResult()
+            try:
+                new_text = getattr(parsed, "text", None)
+                if new_text is None:
+                    try:
+                        new_text = str(parsed)
+                    except Exception:
+                        new_text = wrapped
+                params.message = new_text
+                log(f"Set params.message to parsed text: '{new_text}'")
+            except Exception as e:
+                log(f"Failed to set params.message: {e}")
+                return HookResult()
+            try:
+                entities_raw = getattr(parsed, "entities", []) or []
+                try:
+                    ArrayList = jclass('java.util.ArrayList')
+                    java_list = ArrayList()
+                    added = 0
+                    for ent in entities_raw:
+                        try:
+                            tl = ent.to_tlrpc_object()
+                            java_list.add(tl)
+                            added += 1
+                        except Exception as e:
+                            log(f"Entity conversion error: {e}")
+                            continue
+                    try:
+                        params.entities = java_list
+                        try:
+                            size = java_list.size()
+                        except Exception:
+                            size = added
+                        log(f"Set params.entities with {size} entities (Java ArrayList)")
+                    except Exception as e:
+                        log(f"Failed to set params.entities to Java ArrayList: {e}")
+                        raise
+                except Exception as e:
+                    log(f"Conversion to Java ArrayList failed: {e}")
+                    fallback = []
+                    count = 0
+                    for ent in entities_raw:
+                        try:
+                            fallback.append(ent.to_tlrpc_object())
+                            count += 1
+                        except Exception as e2:
+                            log(f"Fallback entity conversion error: {e2}")
+                            continue
+                    try:
+                        params.entities = fallback
+                        log(f"Fallback: set params.entities to python list with {count} items")
+                    except Exception as e3:
+                        log(f"Fallback failed to set params.entities: {e3}")
+            except Exception as e:
+                log(f"Unexpected error while preparing entities: {e}")
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+        except Exception as e:
+            log(f"TextFormatterPlugin on_send_message_hook error: {e}")
+            return HookResult()
